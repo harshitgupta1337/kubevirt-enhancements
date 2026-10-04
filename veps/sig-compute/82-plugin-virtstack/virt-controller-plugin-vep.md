@@ -47,8 +47,7 @@ The final Pod is validated by `virt-controller` to check for proper construction
 
 The current launcher Pod renderer combines two different categories of work:
 
-- common KubeVirt orchestration that is independent of the selected
-  virtualization stack; and
+- common KubeVirt orchestration that is independent of the selected virtualization stack; and
 - details required by the in-tree Libvirt/QEMU/KVM stack.
 
 Examples of stack-specific behavior include:
@@ -59,20 +58,10 @@ Examples of stack-specific behavior include:
 - requesting `/dev/kvm`, `/dev/mshv`, or another hypervisor resource;
 - calculating memory consumed by the VMM and management processes;
 - selecting nodes by machine type, CPU model, firmware, or stack capability;
-- adding stack-specific security context fields and capabilities.
 
-Adding a separate RPC for each such decision would expose KubeVirt's current
-Libvirt-oriented decomposition as the plugin API. Every new stack-specific Pod
-property would require a new RPC and coordinated changes in core and plugin
-implementations. It would also allow individually valid responses to combine
-into an invalid Pod.
+Letting cluster admins customize the virtualization-stack-specific portion of the `virt-launcher` pod spec (or even update virtualization-stack-agnostic parts for that matter) would allow them to run `virt-launcher` pods containing alternate virtualization components without modifying KubeVirt core.
 
-A Pod-level contract instead makes the ownership boundary explicit:
-`virt-controller` supplies a common base Pod, and the plugin returns the
-completed Pod. It lets plugin implementations evolve without expanding the RPC
-catalog for every Pod field while preserving one core validation point.
-
-Two delivery methods are required because plugin authors have different needs:
+Based on the Structured Plugins design, two methods for customizing the base `virt-launcher` pod are considered, based on the extent of customization needed:
 
 - CEL provides a lightweight, declarative, side-effect-free option for stacks
   whose Pod changes can be expressed as bounded transformations.
@@ -81,15 +70,13 @@ Two delivery methods are required because plugin authors have different needs:
 
 ## Goals
 
-- Separate stack-neutral launcher Pod construction from stack-specific
-  completion.
-- Support both CEL and Pod-level RPC as first-class renderer methods.
+- Separate stack-agnostic launcher Pod construction from stack-specific
+  customization.
+- Support both CEL and RPC as first-class renderer methods.
 - Give both methods the same logical input, output, ownership rules, and final
   validation requirements.
 - Keep Kubernetes clients, informer stores, controller caches, and resolved
   cluster state inside `virt-controller`.
-- Permit a stack plugin to set all stack-owned Pod fields without adding a new
-  RPC for every field.
 - Preserve common KubeVirt behavior and security policy across all
   virtualization stacks.
 - Isolate renderer failures to affected VMIs and avoid making
@@ -109,7 +96,7 @@ Two delivery methods are required because plugin authors have different needs:
 - Allowing a renderer to create Kubernetes resources or call back into
   `virt-controller`.
 - Exposing controller-local clients, informer stores, or Go implementation
-  types through the renderer API.
+  types through the proposed plugin API. The plugin implementation does not have access to any data structures from core KubeVirt. 
 - Providing arbitrary Pod mutation to unprivileged VMI users. Renderers are
   installed and selected according to cluster-administrator policy.
 - Replacing the public offline Pod rendering API proposed by VEP 359. This
