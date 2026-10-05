@@ -33,7 +33,7 @@ This VEP splits rendering into three stages:
 2. The renderer selected for the VMI completes that Pod using one of two supported methods:
    - an in-process CEL renderer; or
    - an RPC cluster-service-based renderer.
-3. `virt-controller` applies generic post-render policy and validates the final Pod before creating it.
+3. `virt-controller` validates the final Pod before creating it.
 
 Both renderer methods implement the same logical transformation:
 
@@ -109,8 +109,7 @@ Based on the Structured Plugins design, two methods for customizing the base `vi
   and need to complete its Pod without changing KubeVirt core.
 - **Platform operators** who install and configure virtualization stack
   plugins.
-- **KubeVirt maintainers** who own the base Pod contract, generic policy, and
-  validation.
+- **KubeVirt maintainers** who own the base Pod contract and validation.
 - **KubeVirt distributors** who may ship additional renderers while preserving
   the upstream control-plane contract.
 
@@ -142,27 +141,23 @@ Based on the Structured Plugins design, two methods for customizing the base `vi
 
 The launcher manifest pipeline is:
 
-1. Resolve controller-local data.
-2. Construct the stack-neutral base Pod.
-3. Build a versioned render request.
-4. Invoke the selected CEL or RPC renderer.
-5. Receive the final Pod.
-6. Apply generic post-render policy.
-7. Validate the final Pod and its preservation of the base contract.
-8. Create the Pod, or report a render failure on the VMI and retry according
+1. Construct the stack-neutral base Pod.
+2. Build a versioned render request.
+3. Invoke the selected CEL or RPC renderer.
+4. Receive the final Pod.
+5. Validate the final Pod and its preservation of the base contract.
+6. Create the Pod, or report a render failure on the VMI and retry according
    to controller policy.
 
 ```mermaid
 flowchart LR
-    VMI[VirtualMachineInstance] --> Resolve[Resolve controller-local state]
-    Resolve --> Base[Build base Pod]
+    VMI[VirtualMachineInstance] -->  Base[Build base Pod]
     Base --> Select{Renderer method}
     Select -->|CEL| CEL[Evaluate cached CEL program]
     Select -->|RPC| RPC[Call renderer Service]
     CEL --> Final[Final Pod]
     RPC --> Final
-    Final --> Policy[Apply generic post-render policy]
-    Policy --> Validate[Validate final Pod]
+    Final --> Validate[Validate final Pod]
     Validate -->|valid| Create[Create virt-launcher Pod]
     Validate -->|invalid| Failure[Report VMI render failure]
 ```
@@ -186,48 +181,24 @@ type LauncherManifestRenderRequest struct {
 ```
 
 The CEL and RPC adapters both implement this interface. Implementations must
-not mutate shared informer objects or the request's VMI. Core gives each
-renderer an isolated copy of the base Pod and treats the returned Pod as
-untrusted.
+not mutate shared informer objects or the request's VMI.
 
-### Pre-render Resolution
+### Pre-render Resolution and Base Pod Construction
 
-`virt-controller` continues to resolve all state that requires Kubernetes
-clients, informer stores, internal caches, or controller-only data. This
-includes, but is not limited to:
-
+`virt-controller` resolves the parts of `virt-launcher` pod spec that are based on
+top-level KubeVirt API features and virtualization-agnostic functionality. For example,
+- User-specified VMI labels and annotations
 - PVC and DataVolume resolution;
-- backend-storage PVC selection;
 - container disk image IDs;
 - namespace and service-account policy;
-- hook sidecar discovery;
 - image pull secrets;
 - resource claims and DRA state;
 - effective, defaulted `KubeVirtConfiguration`;
 - network, storage, and migration state needed by common Pod construction.
-
-Only serializable values needed to complete the Pod cross the renderer
-boundary. Plugins never receive Kubernetes clients, informer handles,
-`TemplateService`, `ClusterConfig`, or internal caches.
-
-### Base Pod Contract
-
-The base Pod is a functional common launcher skeleton. Core owns:
-
-- Pod metadata, VMI ownership, and common labels and annotations;
-- the `compute` container skeleton;
 - common security context, probes, ports, capabilities, mounts, volume
   devices, and environment such as `POD_NAME`;
 - user-specified CPU, memory, storage, device, and DRA resources that do not
   depend on the virtualization stack;
-- VMI volumes after controller-side resolution;
-- ContainerDisk, kernel boot, VirtioFS, serial console, and hook sidecar
-  containers and volumes;
-- image pull secrets and service-account behavior;
-- DNS, scheduler, priority, tolerations, topology spread, and resource claims;
-- user and cluster node selectors;
-- generic dedicated-CPU and realtime scheduling constraints;
-- user affinity and generic persistent-reservation anti-affinity.
 
 The base `compute` container intentionally omits stack-owned fields:
 
@@ -265,19 +236,17 @@ Renderers must reject unknown modes. Go's `context.Context` is passed to
 in-process adapters and mapped to the RPC deadline and cancellation. It is not
 serialized into the request.
 
+Only serializable values needed to complete the Pod cross the renderer
+boundary. Plugins never receive Kubernetes clients, informer handles,
+`TemplateService`, `ClusterConfig`, or internal caches.
+
 ### Renderer Output
 
 Both methods produce one logical result:
 
 | Field | Type | Description |
 |---|---|---|
-| `pod` | `Pod` | The completed launcher Pod to pass to core policy and validation. |
-
-No partial success is supported. A renderer must return either a complete Pod
-or an explicit error. A success-shaped fallback Pod is not permitted.
-
-The returned Pod is not authoritative until core validation succeeds. Returning
-a Pod does not grant the renderer permission to replace core-owned fields.
+| `pod` | `Pod` | The completed launcher Pod to pass to core validation. |
 
 ### Plugin Responsibilities
 
@@ -303,17 +272,6 @@ A renderer must:
 - be safe when the same request is evaluated more than once;
 - avoid creating resources or causing side effects during rendering;
 - return errors explicitly;
-- support all modes it advertises.
-
-### Generic Post-render Policy
-
-After rendering, core applies only policy that must be identical for every
-stack. This stage must not silently repair malformed plugin output or add
-stack-specific defaults. Its purpose is to enforce final controller policy
-whose inputs are known only after rendering.
-
-Post-render policy and validation are separate: policy may make documented,
-deterministic changes, while validation either accepts or rejects the result.
 
 ### CEL Renderer
 
@@ -401,7 +359,6 @@ message GetPluginInfoRequest {}
 message GetPluginInfoResponse {
   string plugin_name = 1;
   repeated string supported_api_versions = 2;
-  repeated LauncherRenderMode supported_modes = 3;
 }
 
 message RenderLauncherManifestRequest {
@@ -424,19 +381,10 @@ enum LauncherRenderMode {
 }
 ```
 
-The final protobuf package and representation of Kubernetes and KubeVirt
-objects will be selected during implementation. The wire format must preserve
-unknown API fields or reject versions that cannot do so.
-
 `virt-controller` discovers the Service, calls `GetPluginInfo`, and selects the
 highest mutually supported renderer API version. Negotiation is cached and
 invalidated when the registration, Service endpoint set, or controller version
 changes.
-
-Every render call has a deadline and propagates cancellation. Unavailable and
-deadline errors are retryable. Invalid arguments, unsupported versions,
-unsupported modes, and malformed successful responses are non-transient for
-that plugin generation and VMI specification.
 
 Automatic retries must not multiply calls within one reconcile without a
 strict bound. Normal controller work-queue retry and backoff are the primary
@@ -500,11 +448,6 @@ spec:
     socketName: openvmm-mshv.sock
 ```
 
-The CRD uses union validation so `cel` and `rpc` are mutually exclusive and
-one is required. The endpoint must use a namespace allowed by KubeVirt's plugin
-registration policy. Credentials and trust configuration are references to
-administrator-managed resources, not inline secret data.
-
 ### Renderer Selection
 
 The mechanism by which the selected virtualization stack is recorded on a VMI
@@ -518,13 +461,16 @@ launcher Pod to a different stack or renderer. Migration targets use the same
 stack as the source VMI.
 
 The in-tree Libvirt/QEMU/KVM implementation is adapted to the same internal
-coarse-grained renderer interface. This creates a behavioral baseline and
-avoids maintaining a privileged fine-grained path for the default stack.
+coarse-grained renderer interface. However, instead of invoking the virtualization-stack-specific
+renderer via CEL or Cluster Service, appropriate functions are called.
+
+// TODO: The Libvirt/QEMU/KVM renderer should also implement the same interface as the CEL and Cluster Service impls.
 
 ### Validation
 
 The final Pod is treated as untrusted regardless of renderer method.
-Validation runs after generic post-render policy and before Pod creation.
+Validation runs immediately after rendering and before Pod creation. Core does
+not mutate or repair the renderer output before validating it.
 
 Validation must verify:
 
@@ -543,21 +489,9 @@ Validation must verify:
 - output object size and collection-count limits;
 - consistency with the requested render mode.
 
-Core maintains an explicit mutation policy rather than relying only on a
-generic Kubernetes schema check. Fields are categorized as:
-
-- **core-owned and immutable**: the renderer must preserve them;
-- **stack-owned**: the renderer may replace or extend them;
-- **mergeable**: both core and renderer may contribute under documented
-  conflict rules;
-- **forbidden**: the renderer may not set them.
-
 Validation errors include the field path and a stable machine-readable reason,
-but do not expose credentials or sensitive configuration in events.
-
-CEL output does not receive weaker validation because it ran in-process. RPC
-output does not receive stronger functional restrictions merely because it was
-produced out of process. Both methods must satisfy the same final-Pod contract.
+but do not expose credentials or sensitive configuration in events. Both CEL and 
+Cluster Service-based methods must satisfy the same final-Pod validation.
 
 ### Failure Handling and VMI Status
 
@@ -589,9 +523,8 @@ renderer method, observed plugin generation, and a sanitized error summary.
 They must not include the full VMI or Pod.
 
 There is no automatic fallback from a selected external renderer to the
-default stack. Such fallback could silently launch a VM with different
-isolation, device, firmware, or compatibility properties. The only default
-path is the explicitly selected in-tree default renderer.
+default Libvirt/QEMU stack. Such fallback could silently launch a VM with different
+isolation, device, firmware, or compatibility properties.
 
 ### Security
 
@@ -621,27 +554,6 @@ For RPC:
 For both methods, final validation is the security boundary. Core must not
 assume that a registered renderer is correct or uncompromised.
 
-### Observability
-
-`virt-controller` exposes metrics labeled by renderer method and stack ID with
-bounded label cardinality:
-
-- render request count;
-- render success and failure count by stable reason;
-- render latency;
-- RPC availability and deadline failures;
-- CEL compile and evaluation failures;
-- final validation failures;
-- cache hit and invalidation count.
-
-Traces may include renderer method, stack ID, API version, plugin generation,
-and render mode. They must not include the full Pod, VMI, CEL parameters, or
-secret material.
-
-Events and conditions provide actionable user-facing errors. Plugin-definition
-errors are also reflected in the readiness status of the
-`VirtualizationStackPlugin`.
-
 ## API Versioning
 
 Three versions evolve independently:
@@ -655,7 +567,7 @@ The selected contract version determines:
 
 - base Pod invariants;
 - input field semantics;
-- renderer-owned and core-owned fields;
+- plugin-owned and core-owned fields;
 - supported modes;
 - final validation rules.
 
@@ -678,8 +590,7 @@ consume unbounded CPU through loops or recursion.
 RPC renderer Deployments may scale independently. `virt-controller` reuses
 connections, caches successful version negotiation, and bounds concurrent
 requests per endpoint. Render results are not cached across VMIs because
-requests include VMI-specific data. A single reconcile may reuse its result
-but must not share mutable Pod objects.
+requests include VMI-specific data.
 
 Controller work queues provide backpressure. When an RPC endpoint is
 unavailable, retries use exponential backoff and jitter rather than a tight
@@ -692,15 +603,13 @@ or hide status updates.
 The `PluggableVirtualizationStack` feature gate guards plugin selection and
 dispatch during alpha.
 
-With the gate disabled:
+With the gate disabled, only the default in-tree virtualization stack is supported:
 
-- the current default stack behavior is preserved;
 - CEL and external RPC registrations are not invoked;
 - existing VM and VMI APIs require no changes.
-
-With the gate enabled, the in-tree default renderer must produce a Pod
-semantically equivalent to the pre-refactor renderer. Golden and end-to-end
-tests enforce this invariant.
+- However, the in-tree default stack launcher pod rendering logic goes through
+  the two stages of first building base pod and then the virt-stack-specific pieces. 
+  Golden and end-to-end tests would enforce this invariant.
 
 Already-running launcher Pods are not re-rendered during a
 `virt-controller` upgrade. A renderer update affects only Pods rendered after
@@ -720,7 +629,7 @@ During a KubeVirt upgrade:
 
 Rollback cannot preserve VMIs created with a renderer or stack unknown to the
 rolled-back KubeVirt version. Before beta, the project must define and test the
-supported rollback window and operator preflight checks.
+supported rollback window.
 
 ## Alternatives
 
@@ -735,25 +644,6 @@ requires protocol growth for each new Pod concern, creates ordering and
 conflict questions across calls, increases network round trips, and can combine
 individually valid fragments into an invalid Pod. The Pod-level contract
 replaces these RPCs.
-
-### RPC only
-
-Supporting only RPC would provide maximum implementation flexibility and
-process isolation, but would impose a Deployment, Service, certificate, and
-availability lifecycle on renderers that only need bounded declarative Pod
-changes.
-
-Rejected because CEL is a useful first-class option for such renderers.
-
-### CEL only
-
-Supporting only CEL would avoid a network failure mode and simplify
-installation. However, CEL is intentionally not Turing-complete, has limited
-list-index manipulation, and is not appropriate for every stack's
-calculations.
-
-Rejected because fully programmable out-of-process implementations are
-required.
 
 ### Sidecar RPC renderer
 
@@ -772,14 +662,6 @@ state. Common behavior would drift across plugins and become difficult to
 secure or upgrade.
 
 Rejected in favor of core-owned base Pod construction.
-
-### Plugin returns only a patch
-
-A patch-only common contract makes merge mechanics part of every renderer and
-does not provide a directly inspectable completed result at the boundary.
-
-Rejected as the common interface. The CEL adapter may use JSONPatch internally,
-but both supported renderer methods return a final Pod to core.
 
 ## Does it belong to core KubeVirt?
 
@@ -804,11 +686,8 @@ stack-specific completion required by the selected virtualization stack.
 - Verify the in-tree default renderer produces semantically equivalent Pods to
   the pre-refactor path.
 - Run the same contract test table against CEL and RPC adapters.
-- Verify every core-owned field is rejected when removed or changed.
-- Verify allowed stack-owned and mergeable mutations are accepted.
-- Verify every render mode.
+- Verify plugin updates are limited to plugin-owned fields of launcher pod spec and not core-owned parts.
 - Verify nil, oversized, malformed, and incomplete output is rejected.
-- Verify CEL compile, type, cost, evaluation, and patch failures.
 - Verify RPC negotiation, deadlines, cancellation, status mapping, and
   malformed responses.
 
@@ -862,27 +741,25 @@ against the expressions and parameters from their registration manifest.
 - [ ] Guard renderer selection and dispatch with the
   `PluggableVirtualizationStack` feature gate.
 - [ ] Refactor current Pod rendering into stack-neutral base construction,
-  in-tree default completion, generic post-render policy, and final validation.
+  in-tree default completion, and final validation.
 - [ ] Demonstrate semantic equivalence of the in-tree default renderer with
   pre-refactor behavior.
 - [ ] Implement the common versioned render request and final-Pod contract.
 - [ ] Implement CEL compilation, caching, cost limits, JSONPatch application,
   and per-VMI error handling.
-- [ ] Implement Pod-level RPC discovery, version negotiation, mTLS, deadlines,
-  cancellation, and error mapping.
 - [ ] Add `VirtualizationStackPlugin` union fields for exactly one CEL or RPC
   renderer method.
-- [ ] Implement explicit core-owned, stack-owned, mergeable, and forbidden
-  field validation.
-- [ ] Expose VMI conditions, events, and bounded-cardinality metrics.
-- [ ] Run common contract tests against the in-tree, CEL, and RPC renderers.
-- [ ] Demonstrate one non-default virtualization stack end to end through each
-  renderer method.
-- [ ] Verify that invalid output from either method cannot create a Pod.
+- [ ] Implement validation for final launcher pod spec returned by the plugin.
+- [ ] Run common contract tests against the in-tree and CEL.
+- [ ] Demonstrate one non-default virtualization stack end to end.
+- [ ] Verify that invalid output from the renderer plugin cannot create a Pod.
 - [ ] Verify that a renderer failure affects only VMIs selecting that renderer.
 
 ### Beta
 
+- [ ] Implement Pod-level RPC discovery, version negotiation, mTLS, deadlines,
+  cancellation, and error mapping.
+- [ ] Run contract tests against the RPC based renderer.
 - [ ] At least two non-default stack implementations have exercised the
   contract, with at least one CEL and one RPC implementation.
 - [ ] The renderer API and CEL environment have documented compatibility and
@@ -916,8 +793,7 @@ against the expressions and parameters from their registration manifest.
 
 ## Open Questions
 
-- What exact Pod fields belong in the core-owned, stack-owned, mergeable, and
-  forbidden sets for the alpha contract?
+- What exact Pod fields belong in the core-owned and plugin-owned sets for the alpha contract?
 - Which bounded CEL helper functions are required in addition to
   `jsonpatch.escapeKey()` and `indexOfByName()`?
 - What static and runtime CEL cost budgets cover realistic Pods without risking
@@ -926,8 +802,6 @@ against the expressions and parameters from their registration manifest.
   remaining consumable by out-of-tree plugins?
 - What RPC timeout and concurrency defaults are appropriate at supported VMI
   creation rates?
-- How is plugin readiness represented in `VirtualizationStackPlugin` status,
-  especially for a Service with partially ready endpoints?
 - What authentication authority issues and rotates renderer server and client
   certificates?
 - Which VMI condition should own render failures before the VMI has a launcher
