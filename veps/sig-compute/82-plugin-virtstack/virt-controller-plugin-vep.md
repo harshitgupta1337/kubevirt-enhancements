@@ -153,8 +153,10 @@ The launcher manifest pipeline is:
 flowchart LR
     VMI[VirtualMachineInstance] -->  Base[Build base Pod]
     Base --> Select{Renderer method}
+    Select -->|In-tree| Default[Call default renderer]
     Select -->|CEL| CEL[Evaluate cached CEL program]
     Select -->|RPC| RPC[Call renderer Service]
+    Default --> Final[Final Pod]
     CEL --> Final[Final Pod]
     RPC --> Final
     Final --> Validate[Validate final Pod]
@@ -180,7 +182,10 @@ type LauncherManifestRenderRequest struct {
 }
 ```
 
-The CEL and RPC adapters both implement this interface. Implementations must
+The in-tree default renderer, CEL adapter, and RPC adapter all implement this
+interface. The caller does not use a separate rendering contract for the
+default Libvirt/QEMU/KVM stack. Every implementation receives the same request,
+returns a final Pod, and enters the same validation path. Implementations must
 not mutate shared informer objects or the request's VMI.
 
 ### Pre-render Resolution and Base Pod Construction
@@ -460,11 +465,12 @@ re-render before Pod creation, but it must not mutate an already-created
 launcher Pod to a different stack or renderer. Migration targets use the same
 stack as the source VMI.
 
-The in-tree Libvirt/QEMU/KVM implementation is adapted to the same internal
-coarse-grained renderer interface. However, instead of invoking the virtualization-stack-specific
-renderer via CEL or Cluster Service, appropriate functions are called.
-
-// TODO: The Libvirt/QEMU/KVM renderer should also implement the same interface as the CEL and Cluster Service impls.
+The in-tree Libvirt/QEMU/KVM renderer implements the same coarse-grained
+`LauncherManifestRenderer` interface as the CEL and RPC adapters. Its
+implementation calls in-process functions to complete the base Pod rather than
+evaluating CEL or invoking a cluster Service. This difference is internal to
+the renderer implementation; its input, output, error handling, and final
+validation path are identical to those of the other renderer methods.
 
 ### Validation
 
@@ -685,7 +691,8 @@ stack-specific completion required by the selected virtualization stack.
   preserving common Pod behavior.
 - Verify the in-tree default renderer produces semantically equivalent Pods to
   the pre-refactor path.
-- Run the same contract test table against CEL and RPC adapters.
+- Run the same contract test table against the in-tree default renderer, CEL
+  adapter, and RPC adapter.
 - Verify plugin updates are limited to plugin-owned fields of launcher pod spec and not core-owned parts.
 - Verify nil, oversized, malformed, and incomplete output is rejected.
 - Verify RPC negotiation, deadlines, cancellation, status mapping, and
@@ -750,7 +757,8 @@ against the expressions and parameters from their registration manifest.
 - [ ] Add `VirtualizationStackPlugin` union fields for exactly one CEL or RPC
   renderer method.
 - [ ] Implement validation for final launcher pod spec returned by the plugin.
-- [ ] Run common contract tests against the in-tree and CEL.
+- [ ] Run common contract tests against the in-tree default renderer, CEL
+  adapter, and RPC adapter.
 - [ ] Demonstrate one non-default virtualization stack end to end.
 - [ ] Verify that invalid output from the renderer plugin cannot create a Pod.
 - [ ] Verify that a renderer failure affects only VMIs selecting that renderer.
