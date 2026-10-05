@@ -188,6 +188,19 @@ default Libvirt/QEMU/KVM stack. Every implementation receives the same request,
 returns a final Pod, and enters the same validation path. Implementations must
 not mutate shared informer objects or the request's VMI.
 
+### Relationship to VEP 359
+
+This VEP and [VEP 359](../359-public-pod-render-api/vep.md) refactor the same
+`TemplateService.RenderLaunchManifest` pipeline. The work must be sequenced as
+follows:
+
+1. Wire VEP 359's `RenderConfig` and `ManifestRenderer` interfaces into the
+   real `virt-controller` rendering path.
+2. Add a `kubevirt.io/render` subpackage function such as `BasePodFromVMI` and
+   use it to split stack-neutral base-Pod construction from the in-tree
+   Libvirt-specific renderer.
+3. Add CEL and RPC dispatch on top of that split.
+
 ### Pre-render Resolution and Base Pod Construction
 
 `virt-controller` resolves the parts of `virt-launcher` pod spec that are based on
